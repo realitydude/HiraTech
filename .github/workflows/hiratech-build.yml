@@ -1,0 +1,396 @@
+# HiraTech Windows build, based on upstream RustDesk workflows.
+name: Build HiraTech Windows
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: hiratech-windows
+  cancel-in-progress: false
+env:
+  SCITER_RUST_VERSION: '1.75'
+  RUST_VERSION: '1.75'
+  MAC_RUST_VERSION: '1.81'
+  CARGO_NDK_VERSION: 3.1.2
+  SCITER_ARMV7_CMAKE_VERSION: 3.29.7
+  SCITER_NASM_DEBVERSION: 2.15.05-1
+  LLVM_VERSION: 15.0.6
+  FLUTTER_VERSION: 3.24.5
+  ANDROID_FLUTTER_VERSION: 3.24.5
+  FLUTTER_WINDOWS_ARM_VERSION: 3.44.9
+  FLUTTER_ELINUX_VERSION: 3.16.9
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+  VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  VCPKG_CMAKE_VERSION: 4.3.0
+  ARMV7_VCPKG_COMMIT_ID: 6f29f12e82a8293156836ad81cc9bf5af41fe836
+  VERSION: 1.5.0
+  NDK_VERSION: r28c
+jobs:
+  bridge:
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-unknown-linux-gnu
+          os: ubuntu-22.04
+          extra-build-args: ''
+          flutter-version: 3.22.3
+          artifact-name: bridge-artifact
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        ref: ba677a62cc030a9ff061c439cd2a429e70304341
+    - name: Install prerequisites
+      run: |
+        sudo apt-get install ca-certificates -y
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          clang \
+          cmake \
+          curl \
+          gcc \
+          git \
+          g++ \
+          libclang-dev \
+          libgtk-3-dev \
+          llvm-dev \
+          nasm \
+          ninja-build \
+          pkg-config \
+          wget
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: bridge-${{ matrix.job.os }}
+    - name: Install flutter
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.flutter-version }}
+        cache: true
+    - name: Install flutter rust bridge deps
+      shell: bash
+      run: |
+        cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+        cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+        if [[ "${{ matrix.job.flutter-version }}" == "3.22.3" ]]; then
+          # Default Flutter 3.22.3: extended_text 14 needs a newer Dart, so downgrade for resolution.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+        else
+          # Flutter 3.44 bridge for Windows arm64: match that build's source/pubspec state so the
+          # generated *.freezed.dart compiles against the same Flutter/freezed it resolves.
+          bash .github/patches/apply_flutter_3.44_source_patches.sh
+        fi
+        pushd flutter && flutter pub get && popd
+    - name: Run flutter rust bridge
+      run: |
+        ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+        cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+    - name: Upload Artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ matrix.job.artifact-name }}
+        path: |
+          ./src/bridge_generated.rs
+          ./src/bridge_generated.io.rs
+          ./flutter/lib/generated_bridge.dart
+          ./flutter/lib/generated_bridge.freezed.dart
+          ./flutter/macos/Runner/bridge_generated.h
+          ./flutter/ios/Runner/bridge_generated.h
+    env:
+      CARGO_EXPAND_VERSION: 1.0.95
+      FLUTTER_RUST_BRIDGE_VERSION: 1.80.1
+      RUST_VERSION: '1.75'
+    timeout-minutes: 60
+  topmost:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+      upload-artifact: true
+  windows:
+    name: Build HiraTech Windows x64
+    needs:
+    - bridge
+    - topmost
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-pc-windows-msvc
+          os: windows-2022
+          arch: x86_64
+          flutter-arch: x64
+          vcpkg-triplet: x64-windows-static
+          build-args: --vram
+    steps:
+    - name: Checkout build recipe
+      uses: actions/checkout@v4
+    - name: Keep build recipe
+      shell: pwsh
+      run: |
+        $path = Join-Path $env:RUNNER_TEMP 'hiratech-build.yml'
+        Copy-Item .github/workflows/hiratech-build.yml $path
+        "HIRA_WORKFLOW_PATH=$path" >> $env:GITHUB_ENV
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        ref: ba677a62cc030a9ff061c439cd2a429e70304341
+    - name: Apply HiraTech branding and server defaults
+      shell: python
+      run: |
+        from pathlib import Path
+        import shutil
+        root = Path('.')
+        assets = root / 'hiratech-branding'
+        for name in ('HiraTech.ico', 'HiraTech-icon.png', 'HiraTech-logo.png', 'HiraTech-mark.svg'):
+            if not (assets / name).is_file():
+                raise SystemExit('Missing branding file: ' + name)
+        def replace_once(path, old, new):
+            p = root / path
+            value = p.read_text(encoding='utf-8')
+            if value.count(old) != 1:
+                raise SystemExit('Source changed; review branding anchor: ' + path)
+            p.write_text(value.replace(old, new, 1), encoding='utf-8')
+        replace_once('src/core_main.rs',
+            'pub fn core_main() -> Option<Vec<String>> {',
+            'pub fn core_main() -> Option<Vec<String>> {\n    #[cfg(windows)]\n    init_hiratech();')
+        p = root / 'src/core_main.rs'
+        with p.open('a', encoding='utf-8') as f:
+            f.write("""
+
+        #[cfg(windows)]
+        fn init_hiratech() {
+            *config::APP_NAME.write().unwrap() = "HiraTech".to_owned();
+            let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+            defaults.insert("custom-rendezvous-server".to_owned(), "4.hiragroup.tech".to_owned());
+            defaults.insert("relay-server".to_owned(), "4.hiragroup.tech:21117".to_owned());
+            defaults.insert("key".to_owned(), "0xnD9zD6kpeaZGN8C7kT1PnuLT44s5YQ0sV50mRuEWo=".to_owned());
+        }
+        """)
+        for dst in ('res/icon.ico', 'res/tray-icon.ico', 'flutter/windows/runner/resources/app_icon.ico'):
+            shutil.copyfile(assets / 'HiraTech.ico', root / dst)
+        for dst in ('res/icon.png', 'flutter/assets/icon.png'):
+            shutil.copyfile(assets / 'HiraTech-icon.png', root / dst)
+        shutil.copyfile(assets / 'HiraTech-mark.svg', root / 'flutter/assets/icon.svg')
+        for name in ('logo.png', 'logo_light.png', 'logo_dark.png'):
+            shutil.copyfile(assets / 'HiraTech-logo.png', root / 'flutter/assets' / name)
+        # Preserve copyright, license, and protocol/library identifiers.
+        for path in ('flutter/windows/runner/Runner.rc', 'libs/portable/Cargo.toml'):
+            p = root / path
+            text = p.read_text(encoding='utf-8')
+            text = text.replace('"RustDesk Remote Desktop"', '"HiraTech Remote Desktop"')
+            text = text.replace('"RustDesk"', '"HiraTech"')
+            text = text.replace('"rustdesk.exe"', '"HiraTech.exe"')
+            if path.endswith('Runner.rc'):
+                text = text.replace('"InternalName", "rustdesk"', '"InternalName", "HiraTech"')
+            p.write_text(text, encoding='utf-8')
+        print('HiraTech name, default server settings, icons and logo applied.')
+    - name: Restore bridge files
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+        path: ./
+    - name: Install LLVM and Clang
+      uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+      with:
+        version: ${{ env.LLVM_VERSION }}
+    - name: Install flutter
+      id: flutter
+      uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_WINDOWS_ARM_VERSION || env.FLUTTER_VERSION }}
+        architecture: x64
+    - name: Replace engine with rustdesk custom flutter engine
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      run: |
+        flutter doctor -v
+        flutter precache --windows
+        Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+        Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+        mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+    - name: Patch flutter
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      shell: bash
+      run: |
+        cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+        cd $(dirname $(dirname $(which flutter)))
+        if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+        fi
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.SCITER_RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: ${{ matrix.job.os }}
+    - name: Setup vcpkg with Github Actions binary cache
+      uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+      with:
+        vcpkgDirectory: C:\vcpkg
+        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        doNotCache: false
+    - name: Install vcpkg dependencies
+      env:
+        VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
+      run: |
+        if ! $VCPKG_ROOT/vcpkg \
+          install \
+          --triplet ${{ matrix.job.vcpkg-triplet }} \
+          --x-install-root="$VCPKG_ROOT/installed"; then
+          find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+            echo "$_1:"
+            echo "======"
+            cat "$_1"
+            echo "======"
+            echo ""
+          done
+          exit 1
+        fi
+        head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+      shell: bash
+    - name: Build rustdesk
+      run: |
+        # Windows: build RustDesk
+        # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
+        python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+        if ($LASTEXITCODE -ne 0) { throw "RustDesk build failed" }
+                  mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
+
+        # Download usbmmidd_v2.zip and extract it to ./rustdesk
+        Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+        Expand-Archive usbmmidd_v2.zip -DestinationPath .
+        Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+        Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+        mv -Force .\usbmmidd_v2 ./rustdesk
+
+        # Download printer driver files and extract them to ./rustdesk
+        try {
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+
+          # Check and move the files
+          $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+          $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+          $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+          $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+          if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+              Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
+              Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+              mkdir ./rustdesk/drivers
+              mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+              Expand-Archive printer_driver_adapter.zip -DestinationPath .
+              mv -Force .\printer_driver_adapter.dll ./rustdesk
+          } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
+              Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
+          } else {
+              Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
+          }
+        } catch {
+            Write-Host "Ingore the printer driver error."
+        }
+
+        if (-not (Test-Path ./rustdesk/rustdesk.exe)) { throw "Windows executable missing" }
+        if (-not (Test-Path ./rustdesk/librustdesk.dll)) { throw "Rust library missing" }
+    - name: find Runner.res
+      continue-on-error: true
+      shell: bash
+      run: |
+        runner_res=$(find . -name "Runner.res");
+        if [ "$runner_res" == "" ]; then
+          echo "Runner.res: not found";
+        else
+          echo "Runner.res: $runner_res";
+          cp $runner_res ./libs/portable/Runner.res;
+          echo "list ./libs/portable/Runner.res";
+          ls -l ./libs/portable/Runner.res;
+        fi
+    - name: Download RustDeskTempTopMostWindow artifacts
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
+        path: ./rustdesk
+    - name: Package HiraTech executable
+      shell: bash
+      run: |
+        set -euo pipefail
+        mv rustdesk/rustdesk.exe rustdesk/HiraTech.exe
+        cp LICENCE rustdesk/LICENCE
+        sed -i '/dpiAware/d' res/manifest.xml
+        pushd libs/portable
+        python -m pip install -r requirements.txt
+        python generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/HiraTech.exe
+        popd
+        mkdir -p HiraTech-output
+        cp target/release/rustdesk-portable-packer.exe HiraTech-output/HiraTech-Setup.exe
+        sha256sum HiraTech-output/HiraTech-Setup.exe > HiraTech-output/SHA256SUMS.txt
+    - name: Collect corresponding source and build notes
+      shell: python
+      run: |
+        from pathlib import Path
+        import subprocess, zipfile, os
+        root = Path('.')
+        out = root / 'HiraTech-output'
+        with zipfile.ZipFile(out / 'HiraTech-source.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+            for base in (root, root / 'libs/hbb_common'):
+                names = subprocess.check_output(['git', '-C', str(base), 'ls-files', '-z']).decode().split('\0')
+                for name in filter(None, names):
+                    p = base / name
+                    if p.is_file():
+                        archive.write(p, str(p.relative_to(root)))
+            for asset in ('icon.png', 'logo.png', 'logo_light.png', 'logo_dark.png'):
+                p = root / 'flutter/assets' / asset
+                archive.write(p, str(p))
+            workflow = Path(os.environ['HIRA_WORKFLOW_PATH'])
+            archive.write(workflow, 'HIRATECH-BUILD.yml')
+        notes = """HiraTech Windows x64 - custom RustDesk build
+        Run HiraTech-Setup.exe and use the Install option in the application.
+        ID server: 4.hiragroup.tech
+        Relay server: 4.hiragroup.tech:21117
+        Public key: 0xnD9zD6kpeaZGN8C7kT1PnuLT44s5YQ0sV50mRuEWo=
+        Check Ready status and test a connection between two devices.
+        This build is unsigned. No code-signing certificate is included.
+        No permanent remote-access password is set by this build.
+        Preserve LICENCE and provide HiraTech-source.zip when distributing.
+        Source: https://github.com/realitydude/HiraTech
+
+        Modified runtime surface:
+        src/core_main.rs: initializes app name and editable server defaults before startup;
+        this also gives HiraTech its own config, service and installation identity.
+        flutter/windows/runner/Runner.rc and libs/portable/Cargo.toml: product metadata.
+        res/icon.ico, res/tray-icon.ico, res/icon.png, Flutter app icon and assets:
+        replace visual branding. Core networking and authentication are unchanged.
+        The source submodule is not modified. Existing copyright notices are preserved.
+        """
+        (out / 'README.txt').write_text(notes, encoding='utf-8')
+    - name: Upload HiraTech download
+      uses: actions/upload-artifact@v4
+      with:
+        name: HiraTech-Windows-x64
+        path: HiraTech-output/
+        if-no-files-found: error
+        retention-days: 14
+    timeout-minutes: 180
