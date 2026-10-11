@@ -141,7 +141,7 @@ jobs:
       shell: pwsh
       run: |
         $path = Join-Path $env:RUNNER_TEMP 'hiradesk-managed-build.yml'
-        Copy-Item .github/workflows/hiradesk-managed-build.yml $path
+        Copy-Item .github/workflows/hiradesk-managed-auto-build.yml $path
         "HIRA_WORKFLOW_PATH=$path" >> $env:GITHUB_ENV
     - name: Export GitHub Actions cache environment variables
       uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
